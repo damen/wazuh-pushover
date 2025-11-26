@@ -182,26 +182,6 @@ You should see both logs populate and Pushover notifications arrive.
 
 ---
 
-## Troubleshooting
-
-### “Invalid element in the configuration”
-Occurs when:
-
-- An `<integrator>` block is added to `ossec.conf` (remove it)  
-- `<name>` does **not** start with `custom-`  
-- Script name does **not** match the integration `<name>`
-
-### “Missing pushover_user/app_token”
-The `<options>` JSON must include `"user"`.
-
-### One user not receiving alerts
-Use:
-
-- Separate `<integration>` blocks **or**
-- One Pushover **Group Key**
-
----
-
 ## License
 
 MIT License — free to use, modify, and redistribute.
