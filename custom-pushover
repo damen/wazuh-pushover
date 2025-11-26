@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""
+Wazuh → Pushover custom integration.
+
+Features:
+- Works with Wazuh's custom integration calling convention
+  (alert file, api_key, hook_url, optional options JSON/file, etc.).
+- Sends alerts to Pushover using a configurable app token + user or group key.
+- Supports multiple independent <integration> blocks (different users, levels),
+  all pointing to this same script (e.g., via symlinks).
+- Produces concise, readable notifications with severity, rule, agent, and
+  optional Office 365–specific fields.
+
+Tested on:
+- Wazuh Manager 4.x (Amazon Linux)
+- Pushover API v1
+"""
+
+import sys
+import json
+import urllib.request
+import urllib.parse
+import traceback
+
+# Change or disable this if you do not want debug logs.
+DEBUG_LOG = "/tmp/pushover_integration_debug.log"
+
+
+def log(msg: str) -> None:
+    """Append debug messages to a local log file for troubleshooting."""
+    try:
+        with open(DEBUG_LOG, "a") as f:
+            f.write(msg + "\n")
+    except Exception:
+        # Debug logging must never break alert delivery.
+        pass
+
+
+def severity_from_level(level) -> str:
+    """Map Wazuh rule level to a human-friendly severity label."""
+    try:
+        lvl = int(level)
+    except Exception:
+        return "Unknown"
+
+    if lvl >= 12:
+        return "Critical"
+    if lvl >= 8:
+        return "High"
+    if lvl >= 4:
+        return "Medium"
+    return "Low"
+
+
+def load_options_from_argv(argv) -> dict:
+    """
+    Wazuh custom integrations may pass options in one of two ways:
+
+    - argv[4]: inline JSON string
+    - argv[5]: path to a temporary file containing JSON
+
+    This function hides that detail and returns a dict.
+    """
+    options_raw = ""
+    options_file_path = None
+
+    # Inline JSON first (used in manual tests or some Wazuh versions)
+    if len(argv) > 4 and argv[4]:
+        options_raw = argv[4]
+        log(f"Using inline options JSON: {options_raw}")
+    # Otherwise, try loading from options file
+    elif len(argv) > 5 and argv[5]:
+        options_file_path = argv[5]
+        try:
+            with open(options_file_path, "r") as of:
+                options_raw = of.read().strip()
+            log(f"Read options from file {options_file_path}: {options_raw}")
+        except Exception as e:
+            log("Failed to read options file: " + repr(e))
+
+    if not options_raw:
+        return {}
+
+    try:
+        return json.loads(options_raw)
+    except Exception as e:
+        log("Failed to parse options JSON: " + repr(e))
+        return {}
+
+
+def load_alert(alert_file_path: str) -> dict:
+    """
+    Load the alert JSON that Wazuh writes to a temporary file.
+
+    Some versions write a single JSON object; others may append multiple lines,
+    so we:
+      1) try to parse the full file as JSON, and
+      2) fall back to the last non-empty line if that fails.
+    """
+    try:
+        with open(alert_file_path, "r") as f:
+            content = f.read().strip()
+        log("alert_file content: " + content)
+
+        # Try whole file first
+        try:
+            return json.loads(content)
+        except Exception as e_all:
+            log("Failed full-file JSON parse, trying last line: " + repr(e_all))
+
+        # Fallback: last non-empty line
+        lines = [l for l in content.splitlines() if l.strip()]
+        if not lines:
+            raise ValueError("Alert file is empty")
+
+        raw_json = lines[-1]
+        log("raw_json (last line): " + raw_json)
+        return json.loads(raw_json)
+
+    except Exception as e:
+        log("Failed to read/parse alert file: " + repr(e))
+        log(traceback.format_exc())
+        return {}
+
+
+def build_message_from_alert(alert: dict, title_prefix: str) -> (str, str, int):
+    """
+    Build Pushover title and message body from a Wazuh alert JSON.
+    Returns: (title, message, suggested_priority)
+    """
+    rule = alert.get("rule", {})
+    agent = alert.get("agent", {})
+    data = alert.get("data", {})
+    full_log = alert.get("full_log") or data
+
+    level = rule.get("level", "N/A")
+    rule_id = rule.get("id", "N/A")
+    description = rule.get("description", "No description")
+    agent_name = agent.get("name", "unknown-agent")
+    agent_id = agent.get("id", "N/A")
+    severity = severity_from_level(level)
+
+    # Title: e.g., "[High] Wazuh alert"
+    title = f"[{severity}] {title_prefix}"
+
+    lines = []
+    lines.append(description)
+    lines.append(f"Severity: {severity} (level {level})")
+    lines.append(f"Rule: {rule_id} | Agent: {agent_name}/{agent_id}")
+
+    # Office 365–specific formatting (if present)
+    office365 = None
+    if isinstance(data, dict):
+        office365 = data.get("office365") or data.get("Office365")
+
+    if isinstance(office365, dict):
+        op = office365.get("Operation")
+        user = office365.get("UserId") or office365.get("UserKey")
+        workload = office365.get("Workload")
+        ip = office365.get("ClientIP") or office365.get("ClientIp")
+
+        lines.append("")  # blank line
+        if user:
+            lines.append(f"User: {user}")
+        if op:
+            lines.append(f"Operation: {op}")
+        if workload:
+            lines.append(f"Workload: {workload}")
+        if ip:
+            lines.append(f"Client IP: {ip}")
+    else:
+        # Generic fallback: brief snippet of full_log/data
+        snippet = ""
+        try:
+            if isinstance(full_log, (dict, list)):
+                snippet = json.dumps(full_log)
+            else:
+                snippet = str(full_log)
+        except Exception:
+            snippet = str(full_log)
+
+        if snippet:
+            if len(snippet) > 250:
+                snippet = snippet[:247] + "..."
+            lines.append("")
+            lines.append(f"Details: {snippet}")
+
+    message = "\n".join(lines)
+    # Script leaves priority decision to options; we just return 0 here
+    return title, message, 0
+
+
+def send_pushover(
+    api_token: str,
+    user_key: str,
+    title: str,
+    message: str,
+    base_priority: int,
+    device: str = None,
+    extra_opts: dict = None,
+) -> None:
+    """Send a single Pushover notification."""
+    if extra_opts is None:
+        extra_opts = {}
+
+    payload = {
+        "token": api_token,
+        "user": user_key,
+        "title": title,
+        "message": message,
+        "priority": base_priority,
+    }
+
+    if device:
+        payload["device"] = device
+
+    # Pass through optional extras: url, url_title, sound, timestamp, etc.
+    for key in ("url", "url_title", "sound", "timestamp"):
+        if key in extra_opts:
+            payload[key] = extra_opts[key]
+
+    encoded = urllib.parse.urlencode(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.pushover.net/1/messages.json",
+        data=encoded,
+        method="POST",
+    )
+
+    log("Sending request to Pushover with data: " + repr(payload))
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            log(f"Pushover HTTP {resp.status}")
+            log("Pushover response body: " + body)
+    except Exception as e:
+        log("Error sending to Pushover: " + repr(e))
+        log(traceback.format_exc())
+
+
+def main() -> None:
+    log("=== pushover integration start ===")
+    log("argv: " + repr(sys.argv))
+
+    if len(sys.argv) < 4:
+        log("Not enough arguments, exiting.")
+        return
+
+    # Wazuh custom integration arguments:
+    #   argv[1] = alert_file
+    #   argv[2] = api_key        (from <api_key> in ossec.conf)
+    #   argv[3] = hook_url       (from <hook_url> in ossec.conf)
+    #   argv[4] = options JSON   (may be empty)
+    #   argv[5] = options file   (path to JSON), followed by other internal args
+    alert_file_path = sys.argv[1]
+    app_token = sys.argv[2]
+    # hook_url = sys.argv[3]  # not used directly; we hardcode Pushover URL
+
+    options = load_options_from_argv(sys.argv)
+    log(f"Parsed options dict: {options}")
+
+    pushover_user = options.get("user")
+    pushover_device = options.get("device")
+    base_priority = options.get("priority", 0)
+    title_prefix = options.get("title", "Wazuh alert")
+
+    if not pushover_user or not app_token:
+        log("Missing pushover_user or app_token, exiting.")
+        return
+
+    alert = load_alert(alert_file_path)
+    if not alert:
+        log("Alert JSON is empty/invalid, exiting.")
+        return
+
+    title, message, _ = build_message_from_alert(alert, title_prefix)
+    send_pushover(
+        api_token=app_token,
+        user_key=pushover_user,
+        title=title,
+        message=message,
+        base_priority=base_priority,
+        device=pushover_device,
+        extra_opts=options,
+    )
+
+    log("=== pushover integration end ===")
+
+
+if __name__ == "__main__":
+    main()
