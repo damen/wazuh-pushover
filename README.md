@@ -208,13 +208,3 @@ MIT License — free to use, modify, and redistribute.
 
 ---
 
-## Contributions
-
-PRs for:
-
-- Additional formatters  
-- Vendor-specific parsers  
-- Extra notification providers  
-- Rate-limiting / batching  
-
-are welcome.
