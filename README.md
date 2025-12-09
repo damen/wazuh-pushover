@@ -19,7 +19,7 @@ This custom integration script plugs directly into the Wazuh Manager and support
   - Multiple `<integration>` blocks, or
   - A single Pushover **Group Key**
 - **Severity-based routing** (e.g., level ≥ 6 to admin, level ≥ 3 to secondary user)
-- **Readable notifications**, e.g.:
+- **Readable notifications** with key metadata (tenant/user when available), e.g.:
 
 ```
 [High] Wazuh alert 
@@ -27,6 +27,7 @@ Office 365: Sent message using different permissions
 Severity: High (level 6)
 Rule: 91708 | Agent: wazuh-server/000
 
+Tenant: Contoso MSP
 User: someone@example.com
 Operation: SendAs
 Workload: Exchange
@@ -155,6 +156,29 @@ Instead of multiple integrations, you can create a delivery group in Pushover an
 ```
 
 One integration block → many recipients.
+
+---
+
+## Tenant / User Context
+
+The script inspects typical Wazuh / Office 365 fields (tenant/organization IDs, usernames, `winlog.user`, etc.) and automatically adds `Tenant:` and `User:` lines to the push notification when it can find them.
+
+If each tenant runs on a dedicated agent (or you just want explicit labels), provide a `tenant_map` in `<options>` that maps agent IDs or names to the friendly tenant name:
+
+```xml
+<options>
+  {
+    "user": "PUSHOVER_USER_KEY",
+    "title": "Wazuh alert",
+    "tenant_map": {
+      "001": "Contoso",
+      "agent-name": "Tailspin Toys"
+    }
+  }
+</options>
+```
+
+The map is optional; the script still falls back to whatever tenant/user fields are present in the alert body.
 
 ---
 

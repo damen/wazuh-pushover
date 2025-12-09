@@ -123,7 +123,99 @@ def load_alert(alert_file_path: str) -> dict:
         return {}
 
 
-def build_message_from_alert(alert: dict, title_prefix: str) -> (str, str, int):
+def first_present(dicts, keys):
+    """Return the first non-empty value for any key across provided dicts."""
+    for candidate in dicts:
+        if not isinstance(candidate, dict):
+            continue
+        for key in keys:
+            value = candidate.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def resolve_tenant_and_user(alert: dict, tenant_map: dict = None, office365: dict = None):
+    """Return human friendly tenant + user strings extracted from the alert."""
+    agent = alert.get("agent", {})
+    agent_id = agent.get("id")
+    agent_name = agent.get("name")
+
+    resolved_tenant = None
+    if isinstance(tenant_map, dict):
+        # Match by agent id or name to support simple per-tenant agent layouts.
+        if agent_id and agent_id in tenant_map:
+            resolved_tenant = tenant_map.get(agent_id)
+        elif agent_name and agent_name in tenant_map:
+            resolved_tenant = tenant_map.get(agent_name)
+
+    tenant_keys = (
+        "OrganizationId",
+        "OrganizationName",
+        "ClientOrganizationId",
+        "TenantId",
+        "tenant",
+        "tenant_id",
+        "tenantName",
+        "tenantName",
+        "customer",
+        "customer_name",
+        "account",
+        "subscription",
+        "workspace",
+        "domain",
+        "site",
+        "company",
+        "client",
+    )
+
+    user_keys = (
+        "UserId",
+        "UserKey",
+        "UserPrincipalName",
+        "principalName",
+        "principal",
+        "user",
+        "username",
+        "user_name",
+        "account",
+        "actor",
+        "caller",
+        "srcuser",
+        "dstuser",
+        "subject",
+        "SubjectUserName",
+        "TargetUserName",
+        "initiated_by",
+    )
+
+    common_sources = []
+    data = alert.get("data")
+    if isinstance(data, dict):
+        common_sources.append(data)
+        if isinstance(data.get("winlog"), dict):
+            common_sources.append(data.get("winlog"))
+        if isinstance(data.get("office365"), dict):
+            common_sources.append(data.get("office365"))
+        if isinstance(data.get("Office365"), dict):
+            common_sources.append(data.get("Office365"))
+
+    for extra_key in ("fields", "cloud", "kubernetes", "event", "azure"):
+        extra_val = alert.get(extra_key)
+        if isinstance(extra_val, dict):
+            common_sources.append(extra_val)
+
+    if isinstance(office365, dict):
+        common_sources.insert(0, office365)
+
+    if not resolved_tenant:
+        resolved_tenant = first_present(common_sources, tenant_keys)
+
+    resolved_user = first_present(common_sources, user_keys)
+    return resolved_tenant, resolved_user
+
+
+def build_message_from_alert(alert: dict, title_prefix: str, tenant_map: dict = None) -> (str, str, int):
     """
     Build Pushover title and message body from a Wazuh alert JSON.
     Returns: (title, message, suggested_priority)
@@ -153,15 +245,28 @@ def build_message_from_alert(alert: dict, title_prefix: str) -> (str, str, int):
     if isinstance(data, dict):
         office365 = data.get("office365") or data.get("Office365")
 
+    tenant_name, user_name = resolve_tenant_and_user(alert, tenant_map, office365)
+
+    blank_inserted = False
+    meta_lines = []
+    if tenant_name:
+        meta_lines.append(f"Tenant: {tenant_name}")
+    if user_name:
+        meta_lines.append(f"User: {user_name}")
+
+    if meta_lines:
+        lines.append("")
+        lines.extend(meta_lines)
+        blank_inserted = True
+
     if isinstance(office365, dict):
         op = office365.get("Operation")
-        user = office365.get("UserId") or office365.get("UserKey")
         workload = office365.get("Workload")
         ip = office365.get("ClientIP") or office365.get("ClientIp")
 
-        lines.append("")  # blank line
-        if user:
-            lines.append(f"User: {user}")
+        if not blank_inserted:
+            lines.append("")
+            blank_inserted = True
         if op:
             lines.append(f"Operation: {op}")
         if workload:
@@ -182,7 +287,8 @@ def build_message_from_alert(alert: dict, title_prefix: str) -> (str, str, int):
         if snippet:
             if len(snippet) > 250:
                 snippet = snippet[:247] + "..."
-            lines.append("")
+            if not blank_inserted:
+                lines.append("")
             lines.append(f"Details: {snippet}")
 
     message = "\n".join(lines)
@@ -273,7 +379,11 @@ def main() -> None:
         log("Alert JSON is empty/invalid, exiting.")
         return
 
-    title, message, _ = build_message_from_alert(alert, title_prefix)
+    tenant_map = options.get("tenant_map")
+    if not isinstance(tenant_map, dict):
+        tenant_map = None
+
+    title, message, _ = build_message_from_alert(alert, title_prefix, tenant_map=tenant_map)
     send_pushover(
         api_token=app_token,
         user_key=pushover_user,
